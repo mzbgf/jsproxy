@@ -1,290 +1,114 @@
-'use strict'
-
+'use strict';
+const http = require('http');
+const https = require('https');
+const { URL } = require('url');
+// 静态文件 URL
+const ASSET_URL = '<https://etherdream.github.io/jsproxy>';
+const JS_VER = 10;
+const MAX_RETRY = 1;
 /**
- * static files (404.html, sw.js, conf.js)
- */
-const ASSET_URL = 'https://etherdream.github.io/jsproxy'
-
-const JS_VER = 10
-const MAX_RETRY = 1
-
-/** @type {RequestInit} */
-const PREFLIGHT_INIT = {
-  status: 204,
-  headers: new Headers({
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET,POST,PUT,PATCH,TRACE,DELETE,HEAD,OPTIONS',
-    'access-control-max-age': '1728000',
-  }),
-}
-
-/**
+ * 生成响应
  * @param {any} body
  * @param {number} status
  * @param {Object<string, string>} headers
  */
 function makeRes(body, status = 200, headers = {}) {
-  headers['--ver'] = JS_VER
-  headers['access-control-allow-origin'] = '*'
-  return new Response(body, {status, headers})
+  headers['--ver'] = JS_VER;
+  headers['access-control-allow-origin'] = '*';
+  return { body, status, headers };
 }
-
-
 /**
+ * 创建新的 URL 对象
  * @param {string} urlStr 
  */
 function newUrl(urlStr) {
   try {
-    return new URL(urlStr)
+    return new URL(urlStr);
   } catch (err) {
-    return null
+    return null;
   }
 }
-
-
-addEventListener('fetch', e => {
-  const ret = fetchHandler(e)
-    .catch(err => makeRes('cfworker error:\n' + err.stack, 502))
-  e.respondWith(ret)
-})
-
-
 /**
- * @param {FetchEvent} e 
+ * 处理请求
+ * @param {http.IncomingMessage} req 
+ * @param {http.ServerResponse} res 
  */
-async function fetchHandler(e) {
-  const req = e.request
-  const urlStr = req.url
-  const urlObj = new URL(urlStr)
-  const path = urlObj.href.substr(urlObj.origin.length)
-
+async function fetchHandler(req, res) {
+  const urlStr = req.url;
+  const urlObj = new URL(urlStr, `<http://${req.headers.host}>`);
+  const path = urlObj.href.substr(urlObj.origin.length);
   if (urlObj.protocol === 'http:') {
-    urlObj.protocol = 'https:'
-    return makeRes('', 301, {
+    urlObj.protocol = 'https:';
+    const response = makeRes('', 301, {
       'strict-transport-security': 'max-age=99999999; includeSubDomains; preload',
       'location': urlObj.href,
-    })
+    });
+    res.writeHead(response.status, response.headers);
+    res.end(response.body);
+    return;
   }
-
   if (path.startsWith('/http/')) {
-    return httpHandler(req, path.substr(6))
+    const response = await httpHandler(req, path.substr(6));
+    res.writeHead(response.status, response.headers);
+    res.end(response.body);
+    return;
   }
-
+  let response;
   switch (path) {
-  case '/http':
-    return makeRes('请更新 cfworker 到最新版本!')
-  case '/ws':
-    return makeRes('not support', 400)
-  case '/works':
-    return makeRes('it works')
-  default:
-    // static files
-    return fetch(ASSET_URL + path)
+    case '/http':
+      response = makeRes('请更新 cfworker 到最新版本!');
+      break;
+    case '/ws':
+      response = makeRes('not support', 400);
+      break;
+    case '/works':
+      response = makeRes('it works');
+      break;
+    default:
+      // 静态文件
+      response = await fetch(ASSET_URL + path);
+      break;
   }
+  res.writeHead(response.status, response.headers);
+  res.end(response.body);
 }
-
-
 /**
- * @param {Request} req
- * @param {string} pathname
+ * 处理 HTTP 请求
+ * @param {http.IncomingMessage} req 
+ * @param {string} targetUrl 
  */
-function httpHandler(req, pathname) {
-  const reqHdrRaw = req.headers
-  if (reqHdrRaw.has('x-jsproxy')) {
-    return Response.error()
-  }
-
-  // preflight
-  if (req.method === 'OPTIONS' &&
-      reqHdrRaw.has('access-control-request-headers')
-  ) {
-    return new Response(null, PREFLIGHT_INIT)
-  }
-
-  let acehOld = false
-  let rawSvr = ''
-  let rawLen = ''
-  let rawEtag = ''
-
-  const reqHdrNew = new Headers(reqHdrRaw)
-  reqHdrNew.set('x-jsproxy', '1')
-
-  // 此处逻辑和 http-dec-req-hdr.lua 大致相同
-  // https://github.com/EtherDream/jsproxy/blob/master/lua/http-dec-req-hdr.lua
-  const refer = reqHdrNew.get('referer')
-  const query = refer.substr(refer.indexOf('?') + 1)
-  if (!query) {
-    return makeRes('missing params', 403)
-  }
-  const param = new URLSearchParams(query)
-
-  for (const [k, v] of Object.entries(param)) {
-    if (k.substr(0, 2) === '--') {
-      // 系统信息
-      switch (k.substr(2)) {
-      case 'aceh':
-        acehOld = true
-        break
-      case 'raw-info':
-        [rawSvr, rawLen, rawEtag] = v.split('|')
-        break
-      }
-    } else {
-      // 还原 HTTP 请求头
-      if (v) {
-        reqHdrNew.set(k, v)
-      } else {
-        reqHdrNew.delete(k)
-      }
-    }
-  }
-  if (!param.has('referer')) {
-    reqHdrNew.delete('referer')
-  }
-
-  // cfworker 会把路径中的 `//` 合并成 `/`
-  const urlStr = pathname.replace(/^(https?):\/+/, '$1://')
-  const urlObj = newUrl(urlStr)
+async function httpHandler(req, targetUrl) {
+  const urlObj = newUrl(targetUrl);
   if (!urlObj) {
-    return makeRes('invalid proxy url: ' + urlStr, 403)
+    return makeRes('invalid url: ' + targetUrl, 400);
   }
-
-  /** @type {RequestInit} */
-  const reqInit = {
+  const options = {
     method: req.method,
-    headers: reqHdrNew,
-    redirect: 'manual',
-  }
-  if (req.method === 'POST') {
-    reqInit.body = req.body
-  }
-  return proxy(urlObj, reqInit, acehOld, rawLen, 0)
-}
-
-
-/**
- * 
- * @param {URL} urlObj 
- * @param {RequestInit} reqInit 
- * @param {number} retryTimes 
- */
-async function proxy(urlObj, reqInit, acehOld, rawLen, retryTimes) {
-  const res = await fetch(urlObj.href, reqInit)
-  const resHdrOld = res.headers
-  const resHdrNew = new Headers(resHdrOld)
-
-  let expose = '*'
-  
-  for (const [k, v] of resHdrOld.entries()) {
-    if (k === 'access-control-allow-origin' ||
-        k === 'access-control-expose-headers' ||
-        k === 'location' ||
-        k === 'set-cookie'
-    ) {
-      const x = '--' + k
-      resHdrNew.set(x, v)
-      if (acehOld) {
-        expose = expose + ',' + x
-      }
-      resHdrNew.delete(k)
+    headers: req.headers,
+  };
+  return new Promise((resolve, reject) => {
+    const client = urlObj.protocol === 'https:' ? https : http;
+    const proxyReq = client.request(urlObj, options, (proxyRes) => {
+      let body = '';
+      proxyRes.on('data', (chunk) => {
+        body += chunk;
+      });
+      proxyRes.on('end', () => {
+        resolve(makeRes(body, proxyRes.statusCode, proxyRes.headers));
+      });
+    });
+    proxyReq.on('error', (err) => {
+      resolve(makeRes('proxy error: ' + err.message, 502));
+    });
+    if (req.method === 'POST' || req.method === 'PUT') {
+      req.pipe(proxyReq);
+    } else {
+      proxyReq.end();
     }
-    else if (acehOld &&
-      k !== 'cache-control' &&
-      k !== 'content-language' &&
-      k !== 'content-type' &&
-      k !== 'expires' &&
-      k !== 'last-modified' &&
-      k !== 'pragma'
-    ) {
-      expose = expose + ',' + k
-    }
-  }
-
-  if (acehOld) {
-    expose = expose + ',--s'
-    resHdrNew.set('--t', '1')
-  }
-
-  // verify
-  if (rawLen) {
-    const newLen = resHdrOld.get('content-length') || ''
-    const badLen = (rawLen !== newLen)
-
-    if (badLen) {
-      if (retryTimes < MAX_RETRY) {
-        urlObj = await parseYtVideoRedir(urlObj, newLen, res)
-        if (urlObj) {
-          return proxy(urlObj, reqInit, acehOld, rawLen, retryTimes + 1)
-        }
-      }
-      return makeRes(res.body, 400, {
-        '--error': `bad len: ${newLen}, except: ${rawLen}`,
-        'access-control-expose-headers': '--error',
-      })
-    }
-
-    if (retryTimes > 1) {
-      resHdrNew.set('--retry', retryTimes)
-    }
-  }
-
-  let status = res.status
-
-  resHdrNew.set('access-control-expose-headers', expose)
-  resHdrNew.set('access-control-allow-origin', '*')
-  resHdrNew.set('--s', status)
-  resHdrNew.set('--ver', JS_VER)
-
-  resHdrNew.delete('content-security-policy')
-  resHdrNew.delete('content-security-policy-report-only')
-  resHdrNew.delete('clear-site-data')
-
-  if (status === 301 ||
-      status === 302 ||
-      status === 303 ||
-      status === 307 ||
-      status === 308
-  ) {
-    status = status + 10
-  }
-
-  return new Response(res.body, {
-    status,
-    headers: resHdrNew,
-  })
+  });
 }
-
-
-/**
- * @param {URL} urlObj 
- */
-function isYtUrl(urlObj) {
-  return (
-    urlObj.host.endsWith('.googlevideo.com') &&
-    urlObj.pathname.startsWith('/videoplayback')
-  )
-}
-
-/**
- * @param {URL} urlObj 
- * @param {number} newLen 
- * @param {Response} res 
- */
-async function parseYtVideoRedir(urlObj, newLen, res) {
-  if (newLen > 2000) {
-    return null
-  }
-  if (!isYtUrl(urlObj)) {
-    return null
-  }
-  try {
-    const data = await res.text()
-    urlObj = new URL(data)
-  } catch (err) {
-    return null
-  }
-  if (!isYtUrl(urlObj)) {
-    return null
-  }
-  return urlObj
-}
+const server = http.createServer(fetchHandler);
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
