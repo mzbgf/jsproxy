@@ -1,7 +1,12 @@
 'use strict';
 import express from 'express';
+import bodyParser from "body-parser";
+import dotenv from "dotenv";
 import fetch from 'node-fetch';
+dotenv.config();
+
 const app = express();
+app.use(bodyParser.json());
 const port = process.env.PORT || 3000;
 const ASSET_URL = 'https://etherdream.github.io/jsproxy';
 const JS_VER = 10;
