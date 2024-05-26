@@ -42,7 +42,7 @@ app.use(async (req, res) => {
 });
 async function fetchHandler(req) {
   const urlStr = req.url;
-  const urlObj = new URL(req.protocol + '://' + req.get('host') + req.originalUrl);
+  const urlObj = new URL(req.protocol + '://' + req.get('host') + urlStr);
   const path = urlObj.href.substr(urlObj.origin.length);
   if (urlObj.protocol === 'http:') {
     urlObj.protocol = 'https:';
