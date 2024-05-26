@@ -1,26 +1,24 @@
 'use strict';
-const http = require('http');
-const https = require('https');
-const { URL } = require('url');
-// 静态文件 URL
-const ASSET_URL = '<https://etherdream.github.io/jsproxy>';
+const express = require('express');
+const fetch = require('node-fetch');
+const app = express();
+const port = process.env.PORT || 3000;
+const ASSET_URL = 'https://etherdream.github.io/jsproxy';
 const JS_VER = 10;
 const MAX_RETRY = 1;
-/**
- * 生成响应
- * @param {any} body
- * @param {number} status
- * @param {Object<string, string>} headers
- */
+const PREFLIGHT_INIT = {
+  status: 204,
+  headers: {
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET,POST,PUT,PATCH,TRACE,DELETE,HEAD,OPTIONS',
+    'access-control-max-age': '1728000',
+  },
+};
 function makeRes(body, status = 200, headers = {}) {
   headers['--ver'] = JS_VER;
   headers['access-control-allow-origin'] = '*';
   return { body, status, headers };
 }
-/**
- * 创建新的 URL 对象
- * @param {string} urlStr 
- */
 function newUrl(urlStr) {
   try {
     return new URL(urlStr);
@@ -28,87 +26,79 @@ function newUrl(urlStr) {
     return null;
   }
 }
-/**
- * 处理请求
- * @param {http.IncomingMessage} req 
- * @param {http.ServerResponse} res 
- */
-async function fetchHandler(req, res) {
+app.use(async (req, res) => {
+  try {
+    const ret = await fetchHandler(req);
+    res.status(ret.status).set(ret.headers).send(ret.body);
+  } catch (err) {
+    const errorRes = makeRes('cfworker error:\n' + err.stack, 502);
+    res.status(errorRes.status).set(errorRes.headers).send(errorRes.body);
+  }
+});
+async function fetchHandler(req) {
   const urlStr = req.url;
-  const urlObj = new URL(urlStr, `<http://${req.headers.host}>`);
+  const urlObj = new URL(req.protocol + '://' + req.get('host') + req.originalUrl);
   const path = urlObj.href.substr(urlObj.origin.length);
   if (urlObj.protocol === 'http:') {
     urlObj.protocol = 'https:';
-    const response = makeRes('', 301, {
+    return makeRes('', 301, {
       'strict-transport-security': 'max-age=99999999; includeSubDomains; preload',
       'location': urlObj.href,
     });
-    res.writeHead(response.status, response.headers);
-    res.end(response.body);
-    return;
   }
   if (path.startsWith('/http/')) {
-    const response = await httpHandler(req, path.substr(6));
-    res.writeHead(response.status, response.headers);
-    res.end(response.body);
-    return;
+    return httpHandler(req, path.substr(6));
   }
-  let response;
   switch (path) {
     case '/http':
-      response = makeRes('请更新 cfworker 到最新版本!');
-      break;
+      return makeRes('请更新 cfworker 到最新版本!');
     case '/ws':
-      response = makeRes('not support', 400);
-      break;
+      return makeRes('not support', 400);
     case '/works':
-      response = makeRes('it works');
-      break;
+      return makeRes('it works');
     default:
-      // 静态文件
-      response = await fetch(ASSET_URL + path);
-      break;
+      return fetch(ASSET_URL + path).then(response => ({
+        body: response.body,
+        status: response.status,
+        headers: {
+          'content-type': response.headers.get('content-type'),
+          'cache-control': 'max-age=600',
+        },
+      }));
   }
-  res.writeHead(response.status, response.headers);
-  res.end(response.body);
 }
-/**
- * 处理 HTTP 请求
- * @param {http.IncomingMessage} req 
- * @param {string} targetUrl 
- */
-async function httpHandler(req, targetUrl) {
-  const urlObj = newUrl(targetUrl);
-  if (!urlObj) {
-    return makeRes('invalid url: ' + targetUrl, 400);
-  }
-  const options = {
+async function httpHandler(req, urlStr) {
+  const reqInit = {
     method: req.method,
-    headers: req.headers,
+    headers: Object.fromEntries(req.headers),
+    redirect: 'manual',
   };
-  return new Promise((resolve, reject) => {
-    const client = urlObj.protocol === 'https:' ? https : http;
-    const proxyReq = client.request(urlObj, options, (proxyRes) => {
-      let body = '';
-      proxyRes.on('data', (chunk) => {
-        body += chunk;
-      });
-      proxyRes.on('end', () => {
-        resolve(makeRes(body, proxyRes.statusCode, proxyRes.headers));
-      });
-    });
-    proxyReq.on('error', (err) => {
-      resolve(makeRes('proxy error: ' + err.message, 502));
-    });
-    if (req.method === 'POST' || req.method === 'PUT') {
-      req.pipe(proxyReq);
-    } else {
-      proxyReq.end();
+  if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+    reqInit.body = await req.buffer();
+  }
+  const urlObj = newUrl(urlStr);
+  if (!urlObj) {
+    return makeRes('invalid url: ' + urlStr, 400);
+  }
+  for (let i = 0; i <= MAX_RETRY; i++) {
+    try {
+      const res = await fetch(urlObj.href, reqInit);
+      const resHdrNew = {
+        'content-type': res.headers.get('content-type'),
+        'cache-control': 'no-store',
+        'access-control-allow-origin': '*',
+      };
+      return makeRes(await res.buffer(), res.status, resHdrNew);
+    } catch (err) {
+      if (i === MAX_RETRY) {
+        return makeRes('fetch error: ' + err.stack, 502);
+      }
     }
-  });
+  }
 }
-const server = http.createServer(fetchHandler);
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+app.options('*', (req, res) => {
+  res.status(PREFLIGHT_INIT.status).set(PREFLIGHT_INIT.headers).send();
+});
+app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
 });
